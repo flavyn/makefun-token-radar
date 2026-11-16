@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Radar — pre-token protocols ranked by implied value</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="head">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <div>
+      <h1>Token Radar</h1>
+      <p class="sub">Pre-token protocols, ranked by what their token could be worth if the record stayed as it is.</p>
+    </div>
+  </div>
+  <dl class="stats" id="stats"></dl>
+</header>
+
+<section class="model" id="model">
+  <h2>How a row is priced</h2>
+  <p class="eq" id="eq"></p>
+  <ul class="notes" id="notes"></ul>
+</section>
+
+<section class="controls" aria-label="Filter and sort the board">
+  <label class="field"><span>Search</span>
+    <input id="q" type="search" placeholder="protocol, category or chain" autocomplete="off">
+  </label>
+  <label class="field"><span>Category</span>
+    <select id="cat"><option value="">All categories</option></select>
+  </label>
+  <label class="field"><span>Sort by</span>
+    <select id="sort">
+      <option value="rank">Rank</option>
+      <option value="implied">Implied value</option>
+      <option value="tvl">TVL</option>
+      <option value="growth">7-day growth</option>
+      <option value="age">Time without a token</option>
+    </select>
+  </label>
+  <label class="field check"><input id="only" type="checkbox"> Watchlist only</label>
+  <p class="count" id="count"></p>
+</section>
+
+<main class="split">
+  <div class="board-wrap">
+    <table class="board" id="board">
+      <thead><tr>
+        <th class="num">#</th><th>Protocol</th><th>Category</th><th class="num">TVL</th>
+        <th class="num">7d</th><th class="num">Age</th><th class="num">Implied value</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <aside class="detail" id="detail" aria-live="polite"></aside>
+</main>
+
+<section class="live">
+  <h2>Already trading, so not on the board</h2>
+  <p class="sub">These record a token and a market cap: the market already prices them, so the radar keeps them out of the ranking and shows what it trades at.</p>
+  <ul class="live-list" id="live"></ul>
+</section>
+
+<footer class="foot">
+  <p>Snapshot <span id="asof"></span>. Model <span id="ver"></span>. Every figure derives from the snapshot's own fields: TVL, seven-day change, and how long the protocol has run with no token recorded. No name is special-cased.</p>
+</footer>
+
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
