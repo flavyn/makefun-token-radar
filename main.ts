@@ -16,6 +16,12 @@ import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------- the model, one definition
 
+// The implied value, in words: take 45% of a protocol's TVL (the 0.45 base multiple), multiply it
+// by the seven-day TVL growth factor (1 + change/100 x 1.55, with the change clamped to -50%..+150%),
+// and multiply that by the maturity factor, which runs from 0.85 at day 0 up to 1.25 at 1095 days
+// (0.85 + min(age, 1095)/1095 x 0.4) and stays there. Round to whole dollars, never below $1. A
+// protocol with no listing date is scored at the model's unknown age of 180 days.
+
 /** Every constant the implied value is made of; data.js carries the same numbers for the page. */
 const MODEL = {
   base_multiple: 0.45,
@@ -29,7 +35,7 @@ const MODEL = {
 } as const;
 
 /** A version string for the scoring function, shown in the page footer. */
-const MODEL_VERSION = 'token-radar/implied-value/v1';
+const MODEL_VERSION = 'token-radar/1.1';
 
 /** The board is refused below this many rows: a short board is not a radar. */
 const MIN_ROWS = 100;
@@ -137,14 +143,20 @@ class RadarError extends Error {
 
 // ---------------------------------------------------------------- command line
 
-function parseArgs(argv: string[]): { input: string; output: string } {
+function parseArgs(argv: string[]): { input: string; output: string; verbose: boolean } {
   let input = '/input';
   let output = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+  let verbose = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (!arg.startsWith('--')) continue;
     const eq = arg.indexOf('=');
     const name = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
+    if (name === 'verbose') {
+      const flag = eq === -1 ? 'true' : arg.slice(eq + 1);
+      verbose = flag !== 'false' && flag !== '0';
+      continue;
+    }
     let value = eq === -1 ? undefined : arg.slice(eq + 1);
     if (value === undefined) {
       const next = argv[i + 1];
@@ -157,7 +169,7 @@ function parseArgs(argv: string[]): { input: string; output: string } {
     if (name === 'input') input = value;
     else if (name === 'output') output = value;
   }
-  return { input, output };
+  return { input, output, verbose };
 }
 
 /** A .json path is the snapshot itself; anything else is a directory holding snapshot.json. */
@@ -518,6 +530,15 @@ function run(): void {
   console.log(
     `wrote board.json, data.js, ${dashboardFiles.length} dashboard files, ${screenshotFiles.length} screenshots and dossier.json in ${outDir}`,
   );
+
+  if (args.verbose) {
+    console.log('top five rows by implied value:');
+    for (const row of rows.slice(0, 5)) {
+      console.log(
+        `  #${row.rank} ${row.name}: implied $${row.implied_value_usd.toLocaleString('en-US')}, growth x${row.growth_multiplier.toFixed(4)}, maturity x${row.maturity_multiplier.toFixed(4)}`,
+      );
+    }
+  }
 }
 
 try {
