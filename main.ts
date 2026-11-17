@@ -80,6 +80,12 @@ interface Fit {
   n: number;
   r2: number;
   residual_sd_log: number;
+  /** True when this snapshot could not be fitted and the shipped coefficients are used. */
+  fallback?: boolean;
+  /** Why the fit fell back; empty on a successful refit. */
+  note?: string;
+  /** Live comps this snapshot offered, whether or not they were enough to fit. */
+  comps_seen?: number;
 }
 
 interface Band {
@@ -313,70 +319,95 @@ interface FitResult {
   band: Band;
 }
 
+/** The fit this entry ships: 128 live comps of the 2026-11-14 snapshot, in-sample R² 0.2115. */
+const SHIPPED_FIT = { a: 6.6916, b: 0.5267, c: -3.7744, d: -0.1493, n: 128, r2: 0.2115, residual_sd_log: 2.0543 };
+const SHIPPED_BAND = { p10_ratio: 0.1097, p90_ratio: 16.7611, low_multiplier: 0.0597, high_multiplier: 9.114 };
+
+/**
+ * A snapshot too thin or too collinear to fit falls back to the shipped coefficients instead of
+ * failing the run: a radar with a known older calibration beats no radar at all.
+ */
+function shippedFit(compsSeen: number, reason: string): FitResult {
+  return {
+    fit: { ...SHIPPED_FIT, fallback: true, note: reason, comps_seen: compsSeen },
+    band: { ...SHIPPED_BAND },
+  };
+}
+
 /**
  * log(mcap) = a + b·log(tvl) + c·(clamp(change_7d,-50,150)/100) + d·log1p(age/365)
  * fitted by normal equations on the snapshot's own live protocols (token, mcap > 0, tvl >= $1M).
- * A comp with no listing date is fitted at the model's unknown age, 180 days.
+ * A comp with no listing date is fitted at the model's unknown age, 180 days. Every way the fit can
+ * fail (too few comps, a singular system, non-positive residual ratios) returns the shipped fit.
  */
 function fitComps(snapshot: Snapshot): FitResult {
   const comps = snapshot.protocols.filter(
     (p) => typeof p.mcap_usd === 'number' && p.mcap_usd > 0 && typeof p.tvl_usd === 'number' && p.tvl_usd >= 1e6,
   );
-  if (comps.length < 8) throw new RadarError(`fit: ${comps.length} live comps, too few to fit four parameters`);
 
-  const rows: number[][] = [];
-  const targets: number[] = [];
-  for (const p of comps) {
-    const growth = clamp(typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0, -50, 150);
-    const age = daysBetween(p.listed_at, snapshot.as_of);
-    const ageYears = (age === null ? UNKNOWN_AGE_DAYS : age) / 365;
-    rows.push([1, Math.log(p.tvl_usd), growth / 100, Math.log1p(ageYears)]);
-    targets.push(Math.log(p.mcap_usd as number));
-  }
+  try {
+    if (comps.length < 8) throw new RadarError(`${comps.length} live comps, too few to fit four parameters`);
 
-  const k = 4;
-  const xtx: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
-  const xty: number[] = new Array<number>(k).fill(0);
-  for (let i = 0; i < rows.length; i++) {
-    for (let r = 0; r < k; r++) {
-      xty[r] = xty[r]! + rows[i]![r]! * targets[i]!;
-      for (let c = 0; c < k; c++) xtx[r]![c] = xtx[r]![c]! + rows[i]![r]! * rows[i]![c]!;
+    const rows: number[][] = [];
+    const targets: number[] = [];
+    for (const p of comps) {
+      const growth = clamp(typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0, -50, 150);
+      const age = daysBetween(p.listed_at, snapshot.as_of);
+      const ageYears = (age === null ? UNKNOWN_AGE_DAYS : age) / 365;
+      rows.push([1, Math.log(p.tvl_usd), growth / 100, Math.log1p(ageYears)]);
+      targets.push(Math.log(p.mcap_usd as number));
     }
-  }
-  const beta = solveLinear(xtx, xty);
 
-  const meanY = targets.reduce((s, y) => s + y, 0) / targets.length;
-  let sse = 0;
-  let sst = 0;
-  const ratios: number[] = [];
-  for (let i = 0; i < rows.length; i++) {
-    const fitted = beta.reduce((s, b, j) => s + b * rows[i]![j]!, 0);
-    sse += (targets[i]! - fitted) ** 2;
-    sst += (targets[i]! - meanY) ** 2;
-    ratios.push(Math.exp(fitted) / comps[i]!.mcap_usd!);
-  }
-  ratios.sort((x, y) => x - y);
-  const p10 = percentile(ratios, 0.1);
-  const p90 = percentile(ratios, 0.9);
-  if (!(p10 > 0) || !(p90 > 0)) throw new RadarError('fit: the residual ratios are not positive');
+    const k = 4;
+    const xtx: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+    const xty: number[] = new Array<number>(k).fill(0);
+    for (let i = 0; i < rows.length; i++) {
+      for (let r = 0; r < k; r++) {
+        xty[r] = xty[r]! + rows[i]![r]! * targets[i]!;
+        for (let c = 0; c < k; c++) xtx[r]![c] = xtx[r]![c]! + rows[i]![r]! * rows[i]![c]!;
+      }
+    }
+    const beta = solveLinear(xtx, xty);
 
-  return {
-    fit: {
-      a: round4(beta[0]!),
-      b: round4(beta[1]!),
-      c: round4(beta[2]!),
-      d: round4(beta[3]!),
-      n: comps.length,
-      r2: round4(1 - sse / sst),
-      residual_sd_log: round4(Math.sqrt(sse / comps.length)),
-    },
-    band: {
-      p10_ratio: round4(p10),
-      p90_ratio: round4(p90),
-      low_multiplier: round4(1 / p90),
-      high_multiplier: round4(1 / p10),
-    },
-  };
+    const meanY = targets.reduce((s, y) => s + y, 0) / targets.length;
+    let sse = 0;
+    let sst = 0;
+    const ratios: number[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const fitted = beta.reduce((s, b, j) => s + b * rows[i]![j]!, 0);
+      sse += (targets[i]! - fitted) ** 2;
+      sst += (targets[i]! - meanY) ** 2;
+      ratios.push(Math.exp(fitted) / comps[i]!.mcap_usd!);
+    }
+    ratios.sort((x, y) => x - y);
+    const p10 = percentile(ratios, 0.1);
+    const p90 = percentile(ratios, 0.9);
+    if (!(p10 > 0) || !(p90 > 0)) throw new RadarError('the residual ratios are not positive');
+    if (!(sst > 1e-9 * targets.length)) throw new RadarError('every comp has the same market cap, so the fit has no variance to explain');
+
+    return {
+      fit: {
+        a: round4(beta[0]!),
+        b: round4(beta[1]!),
+        c: round4(beta[2]!),
+        d: round4(beta[3]!),
+        n: comps.length,
+        r2: round4(1 - sse / sst),
+        residual_sd_log: round4(Math.sqrt(sse / comps.length)),
+        fallback: false,
+        comps_seen: comps.length,
+      },
+      band: {
+        p10_ratio: round4(p10),
+        p90_ratio: round4(p90),
+        low_multiplier: round4(1 / p90),
+        high_multiplier: round4(1 / p10),
+      },
+    };
+  } catch (err) {
+    const raw = err instanceof Error ? err.message : String(err);
+    return shippedFit(comps.length, raw.replace(/^fit:\s*/, ''));
+  }
 }
 
 /** The fitted model is the only scorer: the page, the band and the parity check all use it. */
@@ -384,8 +415,15 @@ function impliedFor(p: Protocol, asOf: string, fit: Fit): number {
   const growth = clamp(typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0, -50, 150);
   const age = daysBetween(p.listed_at, asOf);
   const ageYears = (age === null ? UNKNOWN_AGE_DAYS : age) / 365;
-  const logMcap = fit.a + fit.b * Math.log(p.tvl_usd) + fit.c * (growth / 100) + fit.d * Math.log1p(ageYears);
+  const tvl = usableTvl(p);
+  if (tvl <= 0) return 1;
+  const logMcap = fit.a + fit.b * Math.log(tvl) + fit.c * (growth / 100) + fit.d * Math.log1p(ageYears);
   return Math.max(1, Math.round(Math.exp(logMcap)));
+}
+
+/** A TVL the model can take the log of; a row without one still ranks, at the floor of $1. */
+function usableTvl(p: Protocol): number {
+  return typeof p.tvl_usd === 'number' && Number.isFinite(p.tvl_usd) && p.tvl_usd > 0 ? p.tvl_usd : 0;
 }
 
 // ---------------------------------------------------------------- farm-plan generator (port)
@@ -490,9 +528,10 @@ function bridgeFee(src: string, dst: string): number {
 }
 
 function chooseVenueChain(chains: string[]): string {
-  if (chains.length === 0) return 'Ethereum';
-  for (const chain of VENUE_PREFERENCE) if (chains.includes(chain)) return chain;
-  return chains.slice().sort((x, y) => gasUsd(x) - gasUsd(y))[0]!;
+  const list = Array.isArray(chains) ? chains.filter((c): c is string => typeof c === 'string' && c.length > 0) : [];
+  if (list.length === 0) return 'Ethereum';
+  for (const chain of VENUE_PREFERENCE) if (list.includes(chain)) return chain;
+  return list.slice().sort((x, y) => gasUsd(x) - gasUsd(y))[0]!;
 }
 
 function secondChain(p: Protocol, venue: string, deposit: number): { dst: string | null; leg: number } {
@@ -730,12 +769,27 @@ function buildBoard(snapshot: Snapshot, fit: Fit, band: Band): { rows: BoardRow[
   const watchlist = new Set(snapshot.watchlist);
   const asOf = snapshot.as_of;
 
-  const scored = snapshot.protocols.filter(isRankable).map((p) => {
+  // One row per slug: a snapshot that repeats a slug must not repeat a board row.
+  const unique: Protocol[] = [];
+  const seenSlugs = new Set<string>();
+  for (const p of snapshot.protocols) {
+    if (typeof p.slug !== 'string' || seenSlugs.has(p.slug)) continue;
+    seenSlugs.add(p.slug);
+    unique.push(p);
+  }
+
+  const rankable = unique.filter(isRankable);
+  const rankableSlugs = new Set(rankable.map((p) => p.slug));
+  // The watchlist is the competition's floor: a slug on it is ranked whatever its TVL, category or
+  // name, so a filter can never shrink the board below the list the house drew.
+  const forced = unique.filter((p) => watchlist.has(p.slug) && !rankableSlugs.has(p.slug));
+
+  const scored = rankable.concat(forced).map((p) => {
     const age = daysBetween(p.listed_at, asOf);
     const implied = impliedFor(p, asOf, fit);
     const growth = clamp(typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0, -50, 150);
     const ageYears = (age === null ? UNKNOWN_AGE_DAYS : age) / 365;
-    return { p, implied, growth, age, ageYears, logTvl: Math.log(p.tvl_usd), plan: generatePlan(p, age) };
+    return { p, implied, growth, age, ageYears, logTvl: Math.log(usableTvl(p) || 1), plan: generatePlan(p, age) };
   });
 
   // Highest implied value first; equal values break by slug, so two runs always agree.
@@ -770,7 +824,7 @@ function buildBoard(snapshot: Snapshot, fit: Fit, band: Band): { rows: BoardRow[
     farm_steps: entry.plan.steps,
   }));
 
-  const live: LiveRow[] = snapshot.protocols
+  const live: LiveRow[] = unique
     .filter((p) => !isPreToken(p))
     .map((p) => ({ name: p.name, mcap_usd: p.mcap_usd, tvl_usd: p.tvl_usd }))
     .sort((a, b) => {
@@ -886,6 +940,9 @@ function buildIndexHtml(ctx: PageContext): string {
   const eqLine =
     `mcap = exp(${fit.a.toFixed(3)}) · TVL^${fit.b.toFixed(4)} · exp(${fit.c.toFixed(4)} · clamp(change_7d,-50,150)/100) · (1 + age_years)^${fit.d.toFixed(4)}`;
   const band = bandText(ctx.band);
+  const fitLine = fit.fallback
+    ? `a=${fit.a}, b=${fit.b}, c=${fit.c}, d=${fit.d}, n=${fit.n}, R2=${fit.r2}. Shipped coefficients, not refitted: ${esc(fit.note ?? 'this snapshot could not be fitted')} (${fit.comps_seen ?? 0} live comps here). They come from the 2026-11-14 fit on 128 comps; in-sample R² ${fit.r2}, residual sd ${fit.residual_sd_log} log units.`
+    : `a=${fit.a}, b=${fit.b}, c=${fit.c}, d=${fit.d}, n=${fit.n}, R2=${fit.r2}. Fitted on ${fit.n} live protocols (token recorded, market cap above zero); a missing listing date uses ${UNKNOWN_AGE_DAYS} days. In-sample R² ${fit.r2} on log market cap, residual sd ${fit.residual_sd_log} log units.`;
   const table = top
     .map((r) => {
       const cells = [
@@ -923,7 +980,7 @@ function buildIndexHtml(ctx: PageContext): string {
 <section class="card evidence" id="evidence">
   <h2>Evidence — the model behind every row <span class="tag">server-rendered</span></h2>
   <p class="eq">${eqLine}</p>
-  <p class="coef">a=${fit.a}, b=${fit.b}, c=${fit.c}, d=${fit.d}, n=${fit.n}, R2=${fit.r2}. Fitted on ${fit.n} live protocols (token recorded, market cap above zero); a missing listing date uses ${UNKNOWN_AGE_DAYS} days. In-sample R² ${fit.r2} on log market cap, residual sd ${fit.residual_sd_log} log units.</p>
+  <p class="coef">${fitLine}</p>
   <p class="ev-band">80% error band ${band}: the 10th and 90th percentile of predicted/actual market cap over those ${fit.n} comps (${ctx.band.p10_ratio} and ${ctx.band.p90_ratio}), inverted, so it brackets every implied value on this board.</p>
   <p class="parity"><span class="badge" id="parity">${ctx.rowsMatch}</span> rows recomputed from dashboard/data.js match board.json.</p>
   <table class="static">
@@ -1104,7 +1161,11 @@ function run(): void {
   });
   writeFileSync(join(outDir, 'dossier.json'), dossier);
 
-  console.log(`fit: a=${fit.a}, b=${fit.b}, c=${fit.c}, d=${fit.d}, n=${fit.n}, R2=${fit.r2}; band ${bandText(band)}, html ${htmlBytes} bytes`);
+  if (fit.fallback) {
+    console.log(`fit fell back: ${fit.note} — using the shipped a=${fit.a}, b=${fit.b}, c=${fit.c}, d=${fit.d}, band ${bandText(band)}, n=${fit.n}, html ${htmlBytes} bytes`);
+  } else {
+    console.log(`fit: a=${fit.a}, b=${fit.b}, c=${fit.c}, d=${fit.d}, n=${fit.n}, R2=${fit.r2}; band ${bandText(band)}, html ${htmlBytes} bytes`);
+  }
   console.log(
     `mcap = exp(${fit.a.toFixed(3)}) · TVL^${fit.b.toFixed(4)} · growth · seasoning — fitted on ${fit.n} live protocols, R² ${fit.r2}`,
   );
