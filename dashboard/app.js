@@ -588,7 +588,7 @@
       el('tr', null, el('td', { text: 'deposit' }), el('td', { text: money(r.deposit_usd) })),
       el('tr', null, el('td', { text: 'fees (gas, bridge, slippage)' }), el('td', { text: '$' + r.fees_usd.toFixed(2) })),
       el('tr', null, el('td', { text: 'net EV' }), el('td', { text: cash(r.net_ev_usd) })),
-      el('tr', null, el('td', { text: 'break-even FDV' }), el('td', { text: r.break_even_usd ? money(r.break_even_usd) : 'carry covers fees' }))
+      el('tr', null, el('td', { text: 'break-even airdrop value' }), el('td', { text: r.break_even_usd === null || r.break_even_usd === undefined ? 'n/a' : '$' + r.break_even_usd.toFixed(2) }))
     ));
 
     if (r._raw !== r._imp) {

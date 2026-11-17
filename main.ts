@@ -718,19 +718,8 @@ function generatePlan(p: Protocol, age: number | null): Plan {
   const ev = estimateEv(p, deposit, apyPct, age);
   const net = round2(ev.airdrop_ev_usd + ev.carry_usd - total);
 
-  const needed = total - ev.carry_usd;
-  let breakEven: number | null;
-  if (needed <= 0) breakEven = 0;
-  else if (ev.share <= 0) breakEven = null;
-  else {
-    const perFdv = (prof.community_pct / 100) * ev.share * prof.points_boost * SYBIL_HAIRCUT * ev.odds;
-    if (perFdv <= 0) breakEven = null;
-    else if (needed > AIRDROP_CAP_X * deposit) breakEven = null;
-    else {
-      const required = needed / perFdv;
-      breakEven = required <= prof.fdv_floor ? 0 : Math.round(required);
-    }
-  }
+  // Break-even: the fees the plan must earn back, divided by the same airdrop probability net EV uses.
+  const breakEven: number | null = ev.odds > 0 ? round2(total / ev.odds) : null;
 
   return { deposit_usd: deposit, fees_usd: total, net_ev_usd: net, break_even_usd: breakEven, steps: built.steps };
 }
@@ -944,7 +933,7 @@ function buildIndexHtml(ctx: PageContext): string {
 ${table}
     </tbody>
   </table>
-  <p class="ev-method">What is ranked: every protocol with no token at all (no CoinGecko id, no ticker), less exchanges, bridges, staking wrappers and versioned pools. A protocol that records a token sits in the live list, because the market has priced it. Implied value applies the fitted power law to TVL, seven-day growth and time since listing; the line is wrong by about a factor of three on held-out comps, which is why every row carries the band. Deposit, fees and net EV come from a 120-day farm plan whose costs stay under 5% of the stake; break-even is the launch valuation at which airdrop and carry cover those fees.</p>
+  <p class="ev-method">What is ranked: every protocol with no token at all (no CoinGecko id, no ticker), less exchanges, bridges, staking wrappers and versioned pools. A protocol that records a token sits in the live list, because the market has priced it. Implied value applies the fitted power law to TVL, seven-day growth and time since listing; the line is wrong by about a factor of three on held-out comps, which is why every row carries the band. Deposit, fees and net EV come from a 120-day farm plan whose costs stay under 5% of the stake; break-even is those fees divided by the plan's own airdrop probability, the airdrop value at which the plan is even.</p>
 </section>
 
 <section class="band">
