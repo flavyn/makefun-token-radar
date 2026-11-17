@@ -1062,7 +1062,7 @@ function run(): void {
   const dataJs = `window.RADAR = ${JSON.stringify(data)};\n`;
   const boardJson = `${JSON.stringify({ rows })}\n`;
 
-  // The page carries its evidence inside itself; the repo copy is what the dossier ships.
+  // Everything this program writes lands under the output directory: the repository is read-only input.
   const repoRoot = dirname(fileURLToPath(import.meta.url));
   const html = buildIndexHtml({
     asOf: snapshot.as_of,
@@ -1084,12 +1084,15 @@ function run(): void {
     if (NO_URL.test(text)) throw new RadarError('gate: an http:// or https:// survived into the written files');
   }
 
-  writeFileSync(join(repoRoot, 'dashboard', 'index.html'), html);
   writeFileSync(join(outDir, 'board.json'), boardJson);
   writeFileSync(join(outDir, 'data.js'), dataJs);
 
   const dashboardFiles = copyFlatFiles(join(repoRoot, 'dashboard'), join(outDir, 'dashboard'), true);
   const screenshotFiles = copyFlatFiles(join(repoRoot, 'screenshots'), join(outDir, 'screenshots'), true);
+  // The rendered page goes into the output tree after the static files land, so the shipped
+  // dashboard carries the evidence and the repository is never written to at runtime.
+  mkdirSync(join(outDir, 'dashboard'), { recursive: true });
+  writeFileSync(join(outDir, 'dashboard', 'index.html'), html);
   if (screenshotFiles.length < MIN_SCREENSHOTS) {
     throw new RadarError(`only ${screenshotFiles.length} screenshot(s) in screenshots/, need at least ${MIN_SCREENSHOTS}`);
   }
