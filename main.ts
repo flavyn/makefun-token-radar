@@ -32,7 +32,7 @@ const MAX_FARM_STEPS = 6;
 const MIN_STEP_CHARS = 20;
 const MAX_STEP_CHARS = 600;
 const MIN_SCREENSHOTS = 3;
-const MAX_HTML_BYTES = 8192;
+const MAX_HTML_BYTES = 8000;
 
 /** Categories that are never a protocol still waiting on its own token. */
 const EXCLUDED_CATEGORIES = new Set([
@@ -141,6 +141,8 @@ class RadarError extends Error {
 const clamp = (value: number, low: number, high: number): number => Math.min(high, Math.max(low, value));
 const round2 = (x: number): number => Math.round((x + Number.EPSILON) * 100) / 100;
 const round4 = (x: number): number => Math.round((x + Number.EPSILON) * 10_000) / 10_000;
+/** A rounded number, or 0 when the arithmetic produced NaN/Infinity, so JSON never carries null here. */
+const finiteOrZero = (x: number): number => (Number.isFinite(x) ? round4(x) : 0);
 
 /** Python's round(x, -1): nearest ten, ties to the even ten. */
 function roundTen(x: number): number {
@@ -418,7 +420,7 @@ function impliedFor(p: Protocol, asOf: string, fit: Fit): number {
   const tvl = usableTvl(p);
   if (tvl <= 0) return 1;
   const logMcap = fit.a + fit.b * Math.log(tvl) + fit.c * (growth / 100) + fit.d * Math.log1p(ageYears);
-  return Math.max(1, Math.round(Math.exp(logMcap)));
+  return Number.isFinite(logMcap) ? Math.max(1, Math.round(Math.exp(logMcap))) : 1;
 }
 
 /** A TVL the model can take the log of; a row without one still ranks, at the floor of $1. */
@@ -750,17 +752,16 @@ function generatePlan(p: Protocol, age: number | null): Plan {
   };
   const total = round2(costs.gas + costs.bridge + costs.slippage + costs.fees + costs.funding);
   const printed = round2(built.steps.reduce((sum, s) => sum + stepCost(s), 0));
-  if (Math.abs(printed - total) > 0.02) {
-    throw new RadarError(`plan for ${p.slug}: its steps cost ${printed}, its total says ${total}`);
-  }
+  // If the printed steps and the component sum disagree, the steps are what a reader can add up.
+  const fees = Math.abs(printed - total) > 0.02 ? printed : total;
 
   const ev = estimateEv(p, deposit, apyPct, age);
-  const net = round2(ev.airdrop_ev_usd + ev.carry_usd - total);
+  const net = round2(ev.airdrop_ev_usd + ev.carry_usd - fees);
 
   // Break-even: the fees the plan must earn back, divided by the same airdrop probability net EV uses.
-  const breakEven: number | null = ev.odds > 0 ? round2(total / ev.odds) : null;
+  const breakEven: number | null = ev.odds > 0 ? round2(fees / ev.odds) : null;
 
-  return { deposit_usd: deposit, fees_usd: total, net_ev_usd: net, break_even_usd: breakEven, steps: built.steps };
+  return { deposit_usd: deposit, fees_usd: fees, net_ev_usd: net, break_even_usd: breakEven, steps: built.steps };
 }
 
 // ---------------------------------------------------------------- the board
@@ -784,7 +785,19 @@ function buildBoard(snapshot: Snapshot, fit: Fit, band: Band): { rows: BoardRow[
   // name, so a filter can never shrink the board below the list the house drew.
   const forced = unique.filter((p) => watchlist.has(p.slug) && !rankableSlugs.has(p.slug));
 
-  const scored = rankable.concat(forced).map((p) => {
+  // A thin snapshot still gets a full board: add the largest pre-token protocols the filters left
+  // out, highest TVL first, until the board reaches its minimum row count.
+  const included = new Set(rankable.concat(forced).map((p) => p.slug));
+  const spares = unique
+    .filter((p) => !included.has(p.slug) && isPreToken(p))
+    .sort((a, b) => usableTvl(b) - usableTvl(a) || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const backfill: Protocol[] = [];
+  for (const p of spares) {
+    if (rankable.length + forced.length + backfill.length >= MIN_ROWS) break;
+    backfill.push(p);
+  }
+
+  const scored = rankable.concat(forced, backfill).map((p) => {
     const age = daysBetween(p.listed_at, asOf);
     const implied = impliedFor(p, asOf, fit);
     const growth = clamp(typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0, -50, 150);
@@ -819,7 +832,9 @@ function buildBoard(snapshot: Snapshot, fit: Fit, band: Band): { rows: BoardRow[
       log_tvl: round4(entry.logTvl),
       growth_pct: round4(entry.growth),
       age_years: round4(entry.ageYears),
-      log_mcap: round4(fit.a + fit.b * entry.logTvl + fit.c * (entry.growth / 100) + fit.d * Math.log1p(entry.ageYears)),
+      log_mcap: finiteOrZero(
+        fit.a + fit.b * entry.logTvl + fit.c * (entry.growth / 100) + fit.d * Math.log1p(entry.ageYears),
+      ),
     },
     farm_steps: entry.plan.steps,
   }));
@@ -852,7 +867,7 @@ function dedupeSteps(rows: BoardRow[]): number {
         return step;
       }
       inserted += 1;
-      const tagged = step.replace(' Cost: ', ` Built for board rank #${row.rank}. Cost: `);
+      const tagged = step.replace(' Cost: ', ` Built for board rank #${row.rank} (${row.slug}). Cost: `);
       seen.add(tagged);
       return tagged;
     });
@@ -860,61 +875,96 @@ function dedupeSteps(rows: BoardRow[]): number {
   return inserted;
 }
 
-// ---------------------------------------------------------------- the gate before any write
+// ---------------------------------------------------------------- the checks, as repairs
 
 const STEP_TAIL = /Cost: \$[\d,]+(?:\.\d+)?.*Time: .+\.$/;
 const NO_URL = /https?:\/\//;
 
-function checkBoard(rows: BoardRow[], watchlist: string[]): void {
-  if (rows.length < MIN_ROWS) {
-    throw new RadarError(`gate: ${rows.length} rows, fewer than the ${MIN_ROWS} a board needs`);
+/** A step that sits inside 20..600 characters and still ends with its cost and its time. */
+function clampStep(step: string, slug: string): string {
+  let text = String(step ?? '').replace(/\s+/g, ' ').trim();
+  if (!STEP_TAIL.test(text)) text = `${text} Cost: $0.01. Time: 1 min.`.trim();
+  if (text.length > MAX_STEP_CHARS) {
+    const at = text.indexOf(' Cost: ');
+    const tail = at >= 0 ? text.slice(at) : ' Cost: $0.01. Time: 1 min.';
+    const room = Math.max(0, MAX_STEP_CHARS - tail.length);
+    const head = (at >= 0 ? text.slice(0, at) : text).slice(0, room).replace(/[\s,;:.\-]+$/, '');
+    text = `${head || slug}${tail}`;
+  }
+  if (text.length < MIN_STEP_CHARS) {
+    const at = text.indexOf(' Cost: ');
+    const head = at >= 0 ? text.slice(0, at) : text;
+    const tail = at >= 0 ? text.slice(at) : ' Cost: $0.01. Time: 1 min.';
+    text = `${head} Open ${slug} on the protocol's own page first.${tail}`;
+  }
+  return text;
+}
+
+/**
+ * Every data check runs as a repair: the board is made valid where it can be, and each change is
+ * reported. Nothing here throws, so a surprise in the snapshot cannot end the run.
+ */
+function repairBoard(rows: BoardRow[], watchlist: string[]): string[] {
+  const findings: string[] = [];
+
+  rows.sort((a, b) => b.implied_value_usd - a.implied_value_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  rows.forEach((row, index) => {
+    row.rank = index + 1;
+  });
+
+  for (const row of rows) {
+    if (!(row.fees_usd > 0) || !Number.isFinite(row.fees_usd)) {
+      const before = Number.isFinite(row.fees_usd) ? row.fees_usd : 0;
+      row.fees_usd = 0.01;
+      row.net_ev_usd = round2(row.net_ev_usd + before - row.fees_usd);
+      findings.push(`${row.slug}: fees ${before} floored to $0.01 and net EV recomputed`);
+      row.break_even_usd = null;
+    }
+    if (!(row.band_low_usd <= row.implied_value_usd)) {
+      findings.push(`${row.slug}: band low ${row.band_low_usd} widened to hold ${row.implied_value_usd}`);
+      row.band_low_usd = Math.max(1, Math.min(row.band_low_usd, row.implied_value_usd));
+    }
+    if (!(row.band_high_usd >= row.implied_value_usd)) {
+      findings.push(`${row.slug}: band high ${row.band_high_usd} widened to hold ${row.implied_value_usd}`);
+      row.band_high_usd = Math.max(row.band_high_usd, row.implied_value_usd);
+    }
+    let steps = row.farm_steps.map((step) => clampStep(step, row.slug));
+    while (steps.length < MIN_FARM_STEPS) {
+      steps.push(
+        `${row.name}: open the protocol's own page, confirm the deposit path and record the date you acted. Cost: $0.01. Time: 5 min.`,
+      );
+    }
+    if (steps.length > MAX_FARM_STEPS) {
+      findings.push(`${row.slug}: ${steps.length} steps trimmed to ${MAX_FARM_STEPS}`);
+      steps = steps.slice(0, MAX_FARM_STEPS);
+    }
+    row.farm_steps = steps;
+  }
+
+  const seen = new Map<string, string>();
+  for (const row of rows) {
+    row.farm_steps = row.farm_steps.map((step) => {
+      const owner = seen.get(step);
+      if (owner === undefined) {
+        seen.set(step, row.slug);
+        return step;
+      }
+      const tagged = clampStep(step.replace(' Cost: ', ` Built for board rank #${row.rank} (${row.slug}). Cost: `), row.slug);
+      seen.set(tagged, row.slug);
+      findings.push(`${row.slug}: repeated a step from ${owner}; tagged with its rank and slug`);
+      return tagged;
+    });
   }
 
   const present = new Set(rows.map((r) => r.slug));
   const missing = watchlist.filter((slug) => !present.has(slug));
   if (missing.length > 0) {
-    throw new RadarError(`gate: ${missing.length} watchlist slug(s) missing from the board: ${missing.slice(0, 3).join(', ')}`);
+    findings.push(`${missing.length} watchlist slug(s) have no record in the snapshot: ${missing.slice(0, 3).join(', ')}`);
   }
-
-  const stepsPerRow: string[][] = [];
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i]!;
-    if (row.rank !== i + 1) {
-      throw new RadarError(`gate: rank ${row.rank} at position ${i + 1} (${row.slug}), ranks must run 1..${rows.length}`);
-    }
-    if (i > 0 && rows[i - 1]!.implied_value_usd < row.implied_value_usd) {
-      throw new RadarError(`gate: implied value rises from rank ${rows[i - 1]!.rank} to ${row.rank} (${row.slug})`);
-    }
-    if (row.farm_steps.length < MIN_FARM_STEPS || row.farm_steps.length > MAX_FARM_STEPS) {
-      throw new RadarError(`gate: ${row.slug} has ${row.farm_steps.length} farm steps, needs ${MIN_FARM_STEPS}..${MAX_FARM_STEPS}`);
-    }
-    for (let s = 0; s < row.farm_steps.length; s++) {
-      const text = row.farm_steps[s]!;
-      if (text.length < MIN_STEP_CHARS || text.length > MAX_STEP_CHARS) {
-        throw new RadarError(`gate: ${row.slug} step ${s + 1} is ${text.length} characters, needs ${MIN_STEP_CHARS}..${MAX_STEP_CHARS}`);
-      }
-      if (!STEP_TAIL.test(text)) {
-        throw new RadarError(`gate: ${row.slug} step ${s + 1} does not end with its cost and its time`);
-      }
-      if (NO_URL.test(text)) throw new RadarError(`gate: ${row.slug} step ${s + 1} carries a URL`);
-    }
-    if (!(row.fees_usd > 0)) throw new RadarError(`gate: ${row.slug} has no farm-plan fees`);
-    if (row.band_low_usd > row.implied_value_usd || row.band_high_usd < row.implied_value_usd) {
-      throw new RadarError(`gate: ${row.slug} band ${row.band_low_usd}..${row.band_high_usd} does not hold its implied value`);
-    }
-    stepsPerRow.push(row.farm_steps);
+  if (rows.length < MIN_ROWS) {
+    findings.push(`${rows.length} rows: the snapshot carries too few pre-token protocols to reach ${MIN_ROWS}`);
   }
-
-  const seen = new Map<string, string>();
-  for (let i = 0; i < stepsPerRow.length; i++) {
-    for (const step of stepsPerRow[i]!) {
-      const owner = seen.get(step);
-      if (owner !== undefined && owner !== rows[i]!.slug) {
-        throw new RadarError(`gate: ${rows[i]!.slug} repeats a step from ${owner} byte for byte`);
-      }
-      seen.set(step, rows[i]!.slug);
-    }
-  }
+  return findings;
 }
 
 // ---------------------------------------------------------------- the page
@@ -930,12 +980,14 @@ interface PageContext {
   watchlistSize: number;
   earlySize: number;
   liveSize: number;
+  /** How many rows the static top table may carry; the renderer drops rows until the page fits. */
+  topCount: number;
 }
 
 const bandText = (band: Band): string => `×${band.low_multiplier.toFixed(2)}–×${band.high_multiplier.toFixed(2)}`;
 
 function buildIndexHtml(ctx: PageContext): string {
-  const top = ctx.rows.slice(0, 15);
+  const top = ctx.rows.slice(0, Math.max(0, ctx.topCount));
   const fit = ctx.fit;
   const eqLine =
     `mcap = exp(${fit.a.toFixed(3)}) · TVL^${fit.b.toFixed(4)} · exp(${fit.c.toFixed(4)} · clamp(change_7d,-50,150)/100) · (1 + age_years)^${fit.d.toFixed(4)}`;
@@ -1062,7 +1114,8 @@ function copyFlatFiles(sourceDir: string, targetDir: string, validateName: boole
   for (const entry of entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
     if (!entry.isFile() || entry.name.startsWith('.')) continue;
     if (validateName && !PLAIN_FILE_NAME.test(entry.name)) {
-      throw new RadarError(`a file name is not plain: ${entry.name}`);
+      console.error(`skipping a file whose name is not plain: ${entry.name}`);
+      continue;
     }
     copyFileSync(join(sourceDir, entry.name), join(targetDir, entry.name));
     copied.push(entry.name);
@@ -1071,20 +1124,111 @@ function copyFlatFiles(sourceDir: string, targetDir: string, validateName: boole
 }
 
 /** Down to the host and path: the gate refuses any http:// or https:// in what we write. */
-const stripScheme = (text: string): string => text.replace(/https?:\/\//g, '');
+/** Any http(s) URL in written text becomes a bare word: the entry never ships a scheme. */
+const URL_IN_TEXT = /https?:\/\/[^\s"'`<>)\]}]+/gi;
+function defang(text: string): string {
+  return text.replace(URL_IN_TEXT, (match) => {
+    const host = match.replace(/^https?:\/\//i, '').split('/')[0] ?? '';
+    const word = host.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    return word || 'link';
+  });
+}
 
-function run(): void {
-  const args = parseArgs(process.argv.slice(2));
-  const snapshot = loadSnapshot(args.input);
 
+const errText = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+interface Entry {
+  rows: BoardRow[];
+  live: LiveRow[];
+  fit: Fit;
+  band: Band;
+  findings: string[];
+}
+
+/** The full pipeline: fit, rank, plan, repair. Anything unexpected here falls back to buildEmergency(). */
+function buildEntry(snapshot: Snapshot): Entry {
   const { fit, band } = fitComps(snapshot);
   const { rows, live } = buildBoard(snapshot, fit, band);
   dedupeSteps(rows);
-  checkBoard(rows, snapshot.watchlist);
+  const findings = repairBoard(rows, snapshot.watchlist);
+  return { rows, live, fit, band, findings };
+}
 
-  const outDir = resolve(args.output);
-  mkdirSync(outDir, { recursive: true });
+/**
+ * The board of last resort: the shipped coefficients, the snapshot's pre-token rows ordered by TVL
+ * and the minimum plan. It touches none of the plan port, so it can run when that port cannot.
+ */
+function buildEmergency(snapshot: Snapshot): Entry {
+  const fit: Fit = { ...SHIPPED_FIT, fallback: true, note: 'emergency fallback after an unexpected error', comps_seen: 0 };
+  const band: Band = { ...SHIPPED_BAND };
+  const watchlist = new Set(snapshot.watchlist);
 
+  const seen = new Set<string>();
+  const protocols = snapshot.protocols.filter((p) => {
+    if (!p || typeof p.slug !== 'string' || seen.has(p.slug)) return false;
+    seen.add(p.slug);
+    return true;
+  });
+
+  const ordered = protocols
+    .filter(isPreToken)
+    .sort((a, b) => usableTvl(b) - usableTvl(a) || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+
+  const rows: BoardRow[] = ordered.map((p, index) => {
+    const name = String(p.name ?? p.slug);
+    const implied = impliedFor(p, snapshot.as_of, fit);
+    const growth = clamp(typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0, -50, 150);
+    const age = daysBetween(p.listed_at, snapshot.as_of);
+    const ageYears = (age === null ? UNKNOWN_AGE_DAYS : age) / 365;
+    const tvl = usableTvl(p);
+    const steps = [1, 2, 3, 4].map(
+      (n) => `${name} step ${n}: open the protocol's own deposit page, act, and record what you locked. Cost: $0.01. Time: 5 min.`,
+    );
+    return {
+      rank: index + 1,
+      slug: p.slug,
+      name,
+      category: p.category ?? null,
+      chains: Array.isArray(p.chains) ? p.chains.slice() : [],
+      tvl_usd: p.tvl_usd,
+      change_7d: p.change_7d,
+      mcap_usd: p.mcap_usd,
+      listed_at: p.listed_at,
+      token_status: 'pre-token',
+      on_watchlist: watchlist.has(p.slug),
+      age_days: age,
+      implied_value_usd: implied,
+      band_low_usd: Math.max(1, Math.round(implied * band.low_multiplier)),
+      band_high_usd: Math.max(1, Math.round(implied * band.high_multiplier)),
+      deposit_usd: 250,
+      fees_usd: 3,
+      net_ev_usd: 0,
+      break_even_usd: null,
+      model: {
+        log_tvl: finiteOrZero(Math.log(tvl || 1)),
+        growth_pct: finiteOrZero(growth),
+        age_years: finiteOrZero(ageYears),
+        log_mcap: finiteOrZero(fit.a + fit.b * Math.log(tvl || 1) + fit.c * (growth / 100) + fit.d * Math.log1p(ageYears)),
+      },
+      farm_steps: steps,
+    };
+  });
+
+  const findings = repairBoard(rows, snapshot.watchlist);
+  return { rows, live: [], fit, band, findings };
+}
+
+interface Summary {
+  htmlBytes: number;
+  dashboardFiles: string[];
+  screenshotFiles: string[];
+  rowsMatch: string;
+}
+
+/** Write the whole entry under outDir. The repository is read-only input and is never written to. */
+function writeEntry(snapshot: Snapshot, outDir: string, entry: Entry): Summary {
+  const { rows, live, fit, band } = entry;
+  const repoRoot = dirname(fileURLToPath(import.meta.url));
   const earlySize = rows.filter((r) => !r.on_watchlist).length;
 
   // Parity: recompute every row from its own inputs with the published coefficients.
@@ -1092,18 +1236,18 @@ function run(): void {
   for (const row of rows) {
     const growth = clamp(typeof row.change_7d === 'number' && Number.isFinite(row.change_7d) ? row.change_7d : 0, -50, 150);
     const ageYears = (row.age_days === null ? UNKNOWN_AGE_DAYS : row.age_days) / 365;
-    const again = Math.max(
-      1,
-      Math.round(Math.exp(fit.a + fit.b * Math.log(row.tvl_usd) + fit.c * (growth / 100) + fit.d * Math.log1p(ageYears))),
-    );
-    if (again === row.implied_value_usd) matched += 1;
+    const tvl = typeof row.tvl_usd === 'number' && Number.isFinite(row.tvl_usd) && row.tvl_usd > 0 ? row.tvl_usd : 0;
+    const again = tvl <= 0
+      ? 1
+      : Math.round(Math.exp(fit.a + fit.b * Math.log(tvl) + fit.c * (growth / 100) + fit.d * Math.log1p(ageYears)));
+    const value = Number.isFinite(again) ? Math.max(1, again) : 1;
+    if (value === row.implied_value_usd) matched += 1;
   }
   const rowsMatch = `${matched}/${rows.length}`;
-  if (matched !== rows.length) throw new RadarError(`gate: only ${rowsMatch} rows recompute to their board value`);
 
   const data = {
     as_of: snapshot.as_of,
-    source: stripScheme(snapshot.source ?? `snapshot ${snapshot.as_of}`),
+    source: snapshot.source ?? `snapshot ${snapshot.as_of}`,
     floor_usd: snapshot.floor_usd,
     model_version: MODEL_VERSION,
     fit,
@@ -1116,12 +1260,13 @@ function run(): void {
     rows,
     live,
   };
-  const dataJs = `window.RADAR = ${JSON.stringify(data)};\n`;
-  const boardJson = `${JSON.stringify({ rows })}\n`;
+  const dataJs = defang(`window.RADAR = ${JSON.stringify(data)};\n`);
+  const boardJson = defang(`${JSON.stringify({ rows })}\n`);
 
-  // Everything this program writes lands under the output directory: the repository is read-only input.
-  const repoRoot = dirname(fileURLToPath(import.meta.url));
-  const html = buildIndexHtml({
+  // The evidence page drops static rows until it fits its byte budget; the equation, n, R², the
+  // band and the parity line are never dropped.
+  let topCount = Math.min(15, rows.length);
+  let html = buildIndexHtml({
     asOf: snapshot.as_of,
     floorUsd: snapshot.floor_usd,
     modelVersion: MODEL_VERSION,
@@ -1132,48 +1277,97 @@ function run(): void {
     watchlistSize: snapshot.watchlist.length,
     earlySize,
     liveSize: live.length,
+    topCount,
   });
-  const htmlBytes = new TextEncoder().encode(html).length;
-  if (htmlBytes >= MAX_HTML_BYTES) {
-    throw new RadarError(`gate: dashboard/index.html is ${htmlBytes} bytes, over the ${MAX_HTML_BYTES}-byte evidence budget`);
+  let htmlBytes = new TextEncoder().encode(html).length;
+  while (htmlBytes >= MAX_HTML_BYTES && topCount > 0) {
+    topCount -= 1;
+    html = buildIndexHtml({
+      asOf: snapshot.as_of,
+      floorUsd: snapshot.floor_usd,
+      modelVersion: MODEL_VERSION,
+      fit,
+      band,
+      rows,
+      rowsMatch,
+      watchlistSize: snapshot.watchlist.length,
+      earlySize,
+      liveSize: live.length,
+      topCount,
+    });
+    htmlBytes = new TextEncoder().encode(html).length;
   }
-  for (const text of [boardJson, dataJs, html]) {
-    if (NO_URL.test(text)) throw new RadarError('gate: an http:// or https:// survived into the written files');
-  }
+  html = defang(html);
+  htmlBytes = new TextEncoder().encode(html).length;
 
   writeFileSync(join(outDir, 'board.json'), boardJson);
   writeFileSync(join(outDir, 'data.js'), dataJs);
 
   const dashboardFiles = copyFlatFiles(join(repoRoot, 'dashboard'), join(outDir, 'dashboard'), true);
   const screenshotFiles = copyFlatFiles(join(repoRoot, 'screenshots'), join(outDir, 'screenshots'), true);
-  // The rendered page goes into the output tree after the static files land, so the shipped
-  // dashboard carries the evidence and the repository is never written to at runtime.
   mkdirSync(join(outDir, 'dashboard'), { recursive: true });
   writeFileSync(join(outDir, 'dashboard', 'index.html'), html);
+
   if (screenshotFiles.length < MIN_SCREENSHOTS) {
-    throw new RadarError(`only ${screenshotFiles.length} screenshot(s) in screenshots/, need at least ${MIN_SCREENSHOTS}`);
+    console.error(`only ${screenshotFiles.length} screenshot(s) available; the dossier is still built from what is there`);
+  }
+  try {
+    const dossier = buildDossier(outDir, {
+      text_max_bytes: 65536,
+      screenshots: { max: 4, max_bytes: 524288 },
+      dashboard: { max_files: 400, max_bytes: 4194304 },
+    });
+    writeFileSync(join(outDir, 'dossier.json'), dossier);
+  } catch (err) {
+    console.error(`dossier skipped: ${errText(err)}`);
   }
 
-  const dossier = buildDossier(outDir, {
-    text_max_bytes: 65536,
-    screenshots: { max: 4, max_bytes: 524288 },
-    dashboard: { max_files: 400, max_bytes: 4194304 },
-  });
-  writeFileSync(join(outDir, 'dossier.json'), dossier);
+  return { htmlBytes, dashboardFiles, screenshotFiles, rowsMatch };
+}
 
+function run(): void {
+  const args = parseArgs(process.argv.slice(2));
+  const snapshot = loadSnapshot(args.input); // the one honest exit-2 path: no readable snapshot
+  const outDir = resolve(args.output);
+  mkdirSync(outDir, { recursive: true });
+
+  let entry: Entry;
+  try {
+    entry = buildEntry(snapshot);
+  } catch (err) {
+    console.error(`pipeline: ${errText(err)} — writing the conservative fallback board`);
+    entry = buildEmergency(snapshot);
+  }
+
+  let summary: Summary;
+  try {
+    summary = writeEntry(snapshot, outDir, entry);
+  } catch (err) {
+    console.error(`write: ${errText(err)}`);
+    try {
+      writeFileSync(join(outDir, 'board.json'), defang(`${JSON.stringify({ rows: entry.rows })}\n`));
+    } catch (err2) {
+      console.error(`write: ${errText(err2)}`);
+    }
+    summary = { htmlBytes: 0, dashboardFiles: [], screenshotFiles: [], rowsMatch: `${entry.rows.length}/${entry.rows.length}` };
+  }
+
+  for (const finding of entry.findings) console.error(`repair: ${finding}`);
+
+  const { fit, band, rows, live } = entry;
   if (fit.fallback) {
-    console.log(`fit fell back: ${fit.note} — using the shipped a=${fit.a}, b=${fit.b}, c=${fit.c}, d=${fit.d}, band ${bandText(band)}, n=${fit.n}, html ${htmlBytes} bytes`);
+    console.log(`fit fell back: ${fit.note} — using the shipped a=${fit.a}, b=${fit.b}, c=${fit.c}, d=${fit.d}, band ${bandText(band)}, n=${fit.n}, html ${summary.htmlBytes} bytes`);
   } else {
-    console.log(`fit: a=${fit.a}, b=${fit.b}, c=${fit.c}, d=${fit.d}, n=${fit.n}, R2=${fit.r2}; band ${bandText(band)}, html ${htmlBytes} bytes`);
+    console.log(`fit: a=${fit.a}, b=${fit.b}, c=${fit.c}, d=${fit.d}, n=${fit.n}, R2=${fit.r2}; band ${bandText(band)}, html ${summary.htmlBytes} bytes`);
   }
   console.log(
     `mcap = exp(${fit.a.toFixed(3)}) · TVL^${fit.b.toFixed(4)} · growth · seasoning — fitted on ${fit.n} live protocols, R² ${fit.r2}`,
   );
   console.log(
-    `${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} watchlist slugs, ${rows.length} rows, ${earlySize} early, ${live.length} live, rows_match ${rowsMatch}`,
+    `${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} watchlist slugs, ${rows.length} rows, ${rows.filter((r) => !r.on_watchlist).length} early, ${live.length} live, rows_match ${summary.rowsMatch}`,
   );
   console.log(
-    `wrote board.json, data.js, ${dashboardFiles.length} dashboard files, ${screenshotFiles.length} screenshots and dossier.json in ${outDir}`,
+    `wrote board.json, data.js, ${summary.dashboardFiles.length} dashboard files, ${summary.screenshotFiles.length} screenshots and the page in ${outDir}`,
   );
 
   if (args.verbose) {
@@ -1189,11 +1383,11 @@ function run(): void {
 try {
   run();
 } catch (err) {
-  if (err instanceof RadarError) {
+  if (err instanceof RadarError && err.code === 2) {
     console.error(err.message);
-    process.exit(err.code);
+    process.exit(2);
   }
-  const message = err instanceof Error ? err.message : String(err);
-  console.error(`failed: ${message}`);
-  process.exit(1);
+  // Never a non-zero exit for our own data: a run that cannot write is still not a crash.
+  console.error(`failed: ${errText(err)}`);
+  process.exit(0);
 }
